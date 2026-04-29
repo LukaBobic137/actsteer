@@ -1,0 +1,36 @@
+# ===== MODELI (veliki fajlovi) =====
+models/
+*.bin
+*.pt
+*.safetensors
+
+# HuggingFace cache (često ogroman)
+.cache/
+huggingface/
+hf_home/
+
+# ===== DATASETI =====
+data/
+datasets/
+
+# ===== OUTPUTI =====
+outputs/
+logs/
+results/
+
+# ===== PYTHON =====
+__pycache__/
+*.pyc
+*.pyo
+
+# ===== ENV =====
+actsteer-env/
+venv/
+.env
+
+# ===== JUPYTER =====
+.ipynb_checkpoints/
+
+# ===== SYSTEM =====
+.DS_Store
+Thumbs.db
