@@ -28,7 +28,8 @@ model = AutoModelForCausalLM.from_pretrained(
 # LOAD DATASET
 # =========================
 print("Loading dataset...")
-dataset = load_dataset("fblgit/simple-math", split=f"train[:{N_SAMPLES}]")
+dataset = load_dataset("fblgit/simple-math", split="train")
+dataset = dataset.select(range(N_SAMPLES))
 
 # =========================
 # HELPERS
