@@ -66,7 +66,7 @@ def hook_fn(module, input, output):
 handle = model.model.layers[LAYER_ID].mlp.register_forward_hook(hook_fn)
 
 for example in tqdm(dataset):
-    prompt = example["input"]
+    prompt = example["instruction"]
     true_answer = example["output"]
 
     acts = []
