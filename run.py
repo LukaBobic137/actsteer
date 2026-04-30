@@ -29,12 +29,13 @@ model = AutoModelForCausalLM.from_pretrained(
 # =========================
 print("Loading dataset...")
 
-ds = load_dataset("fblgit/simple-math")
-train_splits = [v for k, v in ds.items() if "train" in k]
+ds = load_dataset(
+    "fblgit/simple-math",
+    split="train",
+    verification_mode="no_checks"
+)
 
-dataset = concatenate_datasets(train_splits)
-
-dataset = dataset.select(range(N_SAMPLES))
+dataset = ds.select(range(N_SAMPLES))
 # =========================
 # HELPERS
 # =========================
