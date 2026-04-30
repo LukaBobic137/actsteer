@@ -1,36 +1,16 @@
-# ===== MODELI (veliki fajlovi) =====
-models/
-*.bin
-*.pt
-*.safetensors
-
-# HuggingFace cache (često ogroman)
-.cache/
-huggingface/
-hf_home/
-
-# ===== DATASETI =====
-data/
-datasets/
-
-# ===== OUTPUTI =====
-outputs/
-logs/
-results/
-
-# ===== PYTHON =====
+stored_hs/
+hf_token.txt
 __pycache__/
 *.pyc
-*.pyo
-
-# ===== ENV =====
-actsteer-env/
-venv/
-.env
-
-# ===== JUPYTER =====
-.ipynb_checkpoints/
-
-# ===== SYSTEM =====
+packages-microsoft*
+.vscode/
 .DS_Store
-Thumbs.db
+*.download
+*.zip
+nuget.config
+*/layer_search_out_old
+*/out_old
+*/out
+*/representations
+*/representations_old/
+find_best_layer_test.sh
