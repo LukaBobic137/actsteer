@@ -113,7 +113,7 @@ def evaluate(use_steering=False):
     total = 0
 
     for example in dataset:
-        prompt = example["input"]
+        prompt = example["instruct"]
         true_answer = example["output"]
 
         pred = generate(prompt)
