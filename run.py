@@ -44,13 +44,15 @@ def generate(prompt):
     with torch.no_grad():
         outputs = model.generate(**inputs, max_new_tokens=10)
     return tokenizer.decode(outputs[0], skip_special_tokens=True)
-
 def extract_number(text):
-    nums = re.findall(r"-?\d+", text)
+    nums = re.findall(r"-?\d+\.?\d*", text)
     return nums[-1] if nums else None
 
 def is_correct(pred, true):
-    return extract_number(pred) == str(true)
+    try:
+        return float(extract_number(pred)) == float(true)
+    except:
+        return False
 
 # =========================
 # COLLECT ACTIVATIONS
@@ -93,6 +95,9 @@ print(f"Correct: {len(correct_acts)}, Wrong: {len(wrong_acts)}")
 # BUILD STEERING VECTOR
 # =========================
 print("Building steering vector...")
+if len(correct_acts) == 0 or len(wrong_acts) == 0:
+    print("No balanced data for steering vector!")
+    exit()
 
 correct_mean = torch.stack(correct_acts).mean(dim=0)
 wrong_mean = torch.stack(wrong_acts).mean(dim=0)
