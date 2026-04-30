@@ -3,7 +3,7 @@ import re
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from datasets import load_dataset
 from tqdm import tqdm
-
+from datasets import load_dataset, concatenate_datasets
 # =========================
 # CONFIG
 # =========================
@@ -28,9 +28,13 @@ model = AutoModelForCausalLM.from_pretrained(
 # LOAD DATASET
 # =========================
 print("Loading dataset...")
-dataset = load_dataset("fblgit/simple-math", split="train")
-dataset = dataset.select(range(N_SAMPLES))
 
+ds = load_dataset("fblgit/simple-math")
+train_splits = [v for k, v in ds.items() if "train" in k]
+
+dataset = concatenate_datasets(train_splits)
+
+dataset = dataset.select(range(N_SAMPLES))
 # =========================
 # HELPERS
 # =========================
