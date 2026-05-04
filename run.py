@@ -1,52 +1,58 @@
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from datasets import load_dataset
+import json
 from tqdm import tqdm
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # =========================
 # CONFIG
 # =========================
 MODEL_ID = "meta-llama/Meta-Llama-3-8B"
+DATA_PATH = "function_vectors/dataset_files/extractive/verb_v_adjective_3.json"
+
 N_SAMPLES = 100
 ALPHA = 1.0
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # =========================
 # LOAD MODEL
 # =========================
 print("Loading model...")
-tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
     torch_dtype=torch.float16,
     device_map="auto"
 )
 
-# fix warning
-tokenizer.pad_token = tokenizer.eos_token
+model.eval()
 
 # =========================
 # LOAD DATASET
 # =========================
 print("Loading dataset...")
 
-# ⚠️ OVDJE PROMIJENI PUT DO JSON-a
-dataset = load_dataset(
-    "json",
-    data_files="function_vectors/dataset_files/translation/en_de.json",
-    split="train"
-)
+with open(DATA_PATH, "r") as f:
+    raw = json.load(f)
 
-dataset = dataset.select(range(N_SAMPLES))
-
-print("Columns:", dataset.column_names)
-print("Example:", dataset[0])
+dataset = raw[:N_SAMPLES]
 
 # =========================
 # HELPERS
 # =========================
-def build_prompt(word):
-    return f"Translate the following English word to German:\n{word}\nAnswer:"
+def detect_keys(example):
+    """Find input/output keys dynamically"""
+    input_keys = ["input", "prompt", "instruction", "text"]
+    output_keys = ["output", "answer", "target", "label"]
+
+    inp = next((k for k in input_keys if k in example), None)
+    out = next((k for k in output_keys if k in example), None)
+
+    if inp is None or out is None:
+        raise ValueError(f"Unknown format: {example.keys()}")
+
+    return inp, out
+
 
 def generate(prompt):
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
@@ -54,129 +60,154 @@ def generate(prompt):
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
-            max_new_tokens=10,
-            temperature=0.0
+            max_new_tokens=20,
+            pad_token_id=tokenizer.eos_token_id
         )
 
     return tokenizer.decode(outputs[0], skip_special_tokens=True)
 
+
 def is_correct(pred, true):
-    return true.lower() in pred.lower()
+    return str(true).strip().lower() in pred.strip().lower()
+
 
 # =========================
-# LAYER SETUP (25/50/75)
+# LAYER SELECTION (25%, 50%, 75%)
 # =========================
 n_layers = len(model.model.layers)
 
 layer_ids = [
-    int(0.25 * n_layers),
-    int(0.50 * n_layers),
-    int(0.75 * n_layers),
+    n_layers // 4,
+    n_layers // 2,
+    (3 * n_layers) // 4
 ]
 
-print("Using layers:", layer_ids)
+print(f"Using layers: {layer_ids}")
 
 # =========================
-# MAIN LOOP
+# HOOK STORAGE
 # =========================
-results = {}
+activations = {lid: [] for lid in layer_ids}
 
-for LAYER_ID in layer_ids:
-    print(f"\n=== LAYER {LAYER_ID} ===")
 
-    correct_acts = []
-    wrong_acts = []
+def make_hook(layer_id):
+    def hook(module, input, output):
+        activations[layer_id].append(output[:, -1, :].detach().cpu())
+    return hook
 
-    def hook_fn(module, input, output):
-        acts.append(output[:, -1, :].detach().cpu())
 
-    handle = model.model.layers[LAYER_ID].mlp.register_forward_hook(hook_fn)
+handles = []
+for lid in layer_ids:
+    h = model.model.layers[lid].mlp.register_forward_hook(make_hook(lid))
+    handles.append(h)
 
-    print("Collecting activations...")
 
-    for example in tqdm(dataset):
-        word = example["input"]
-        true_answer = example["output"]
+# =========================
+# COLLECT ACTIVATIONS
+# =========================
+print("Collecting activations...")
 
-        prompt = build_prompt(word)
+correct_acts = {lid: [] for lid in layer_ids}
+wrong_acts = {lid: [] for lid in layer_ids}
 
-        acts = []
+for example in tqdm(dataset):
+    inp_key, out_key = detect_keys(example)
 
-        _ = generate(prompt)
+    prompt = example[inp_key]
+    true = example[out_key]
 
-        if len(acts) == 0:
+    for lid in layer_ids:
+        activations[lid] = []
+
+    pred = generate(prompt)
+
+    for lid in layer_ids:
+        if len(activations[lid]) == 0:
             continue
 
-        act = acts[0]
+        act = activations[lid][0]
+
+        if is_correct(pred, true):
+            correct_acts[lid].append(act)
+        else:
+            wrong_acts[lid].append(act)
+
+
+for h in handles:
+    h.remove()
+
+
+# =========================
+# BUILD STEERING VECTORS
+# =========================
+print("Building steering vectors...")
+
+steering_vectors = {}
+
+for lid in layer_ids:
+    if len(correct_acts[lid]) == 0 or len(wrong_acts[lid]) == 0:
+        print(f"Skipping layer {lid} (not enough data)")
+        continue
+
+    c = torch.stack(correct_acts[lid]).mean(dim=0)
+    w = torch.stack(wrong_acts[lid]).mean(dim=0)
+
+    steering_vectors[lid] = c - w
+
+
+# =========================
+# EVALUATION
+# =========================
+def evaluate(use_steering=False):
+
+    handles = []
+
+    if use_steering:
+
+        def make_steer_hook(lid):
+            vec = steering_vectors[lid]
+
+            def hook(module, input, output):
+                return output + ALPHA * vec.to(output.device)
+
+            return hook
+
+        for lid in steering_vectors:
+            h = model.model.layers[lid].mlp.register_forward_hook(
+                make_steer_hook(lid)
+            )
+            handles.append(h)
+
+    correct = 0
+    total = 0
+
+    for example in dataset:
+        inp_key, out_key = detect_keys(example)
+
+        prompt = example[inp_key]
+        true = example[out_key]
 
         pred = generate(prompt)
 
-        if is_correct(pred, true_answer):
-            correct_acts.append(act)
-        else:
-            wrong_acts.append(act)
+        if is_correct(pred, true):
+            correct += 1
+        total += 1
 
-    handle.remove()
+    for h in handles:
+        h.remove()
 
-    print(f"Correct: {len(correct_acts)}, Wrong: {len(wrong_acts)}")
+    return correct / total
 
-    if len(correct_acts) == 0 or len(wrong_acts) == 0:
-        print("Skipping layer (no balance)")
-        continue
-
-    # =========================
-    # BUILD STEERING VECTOR
-    # =========================
-    print("Building steering vector...")
-
-    correct_mean = torch.stack(correct_acts).mean(dim=0)
-    wrong_mean = torch.stack(wrong_acts).mean(dim=0)
-
-    steering_vector = correct_mean - wrong_mean
-
-    # =========================
-    # EVALUATION
-    # =========================
-    def evaluate(use_steering=False):
-        if use_steering:
-            def steering_hook(module, input, output):
-                return output + ALPHA * steering_vector.to(output.device)
-
-            h = model.model.layers[LAYER_ID].mlp.register_forward_hook(steering_hook)
-
-        correct = 0
-        total = 0
-
-        for example in dataset:
-            word = example["input"]
-            true_answer = example["output"]
-
-            prompt = build_prompt(word)
-
-            pred = generate(prompt)
-
-            if is_correct(pred, true_answer):
-                correct += 1
-
-            total += 1
-
-        if use_steering:
-            h.remove()
-
-        return correct / total
-
-    print("Evaluating baseline...")
-    acc_base = evaluate(False)
-
-    print("Evaluating with steering...")
-    acc_steer = evaluate(True)
-
-    results[LAYER_ID] = (acc_base, acc_steer)
 
 # =========================
-# FINAL RESULTS
+# RUN
 # =========================
-print("\nFINAL RESULTS:")
+print("\nEvaluating baseline...")
+acc_base = evaluate(use_steering=False)
 
-for layer, (base, steer) in results.items():
-    print(f"Layer {layer}: base={base:.3f}, steer={steer:.3f}")
+print("Evaluating with steering...")
+acc_steer = evaluate(use_steering=True)
+
+print("\nRESULTS:")
+print(f"Baseline accuracy: {acc_base:.3f}")
+print(f"Steered accuracy:  {acc_steer:.3f}")
