@@ -33,7 +33,7 @@ print("Loading dataset...")
 # ⚠️ OVDJE PROMIJENI PUT DO JSON-a
 dataset = load_dataset(
     "json",
-    data_files="dataset_files/translation/en_de.json",
+    data_files="function_vectors/dataset_files/translation/en_de.json",
     split="train"
 )
 
