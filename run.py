@@ -5,7 +5,6 @@ import tqdm
 import torch
 import hydra
 from omegaconf import DictConfig, OmegaConf
-from compute_representations_fv import load_fv_dataset
 
 # ------------------------------------------------------------
 # setup
@@ -18,41 +17,8 @@ sys.path.append(project_dir)
 from utils.model_utils import load_model_from_tl_name
 from utils.generation_utils import generate
 
-# ------------------------------------------------------------
-# FV DATASET
-# ------------------------------------------------------------
-FV_DATASET_BASE = "https://raw.githubusercontent.com/ericwtodd/function_vectors/master/dataset_files"
-
-FV_DATASETS = {
-    "english_french": "abstractive/english-french.json",
-    "english_german": "abstractive/english-german.json",
-}
-
-def load_fv_dataset(task_name, local_dir=None):
-    import json, requests
-
-    filename = FV_DATASETS[task_name]
-
-    data = None
-
-    if local_dir:
-        path = os.path.join(local_dir, filename)
-        if os.path.exists(path):
-            with open(path) as f:
-                data = json.load(f)
-
-    if data is None:
-        url = f"{FV_DATASET_BASE}/{filename}"
-        data = requests.get(url, timeout=30).json()
-
-    if isinstance(data, list):
-        inputs = [x["input"] for x in data]
-        outputs = [x["output"] for x in data]
-    else:
-        inputs = data["input"]
-        outputs = data["output"]
-
-    return pd.DataFrame({"input": inputs, "output": outputs})
+# 👇 TAJ IMPORT KOJI SI TRAŽIO
+from compute_representations_fv import load_fv_dataset
 
 
 # ------------------------------------------------------------
@@ -81,7 +47,20 @@ def add_steering_hook(model, layer_idx, steering_vector, alpha=1.0):
 
 
 # ------------------------------------------------------------
-# main
+# task normalizer (FIX ZA TVOJ BUG)
+# ------------------------------------------------------------
+def normalize_tasks(tasks):
+    if tasks is None:
+        return []
+    if isinstance(tasks, str):
+        return [tasks]
+    if isinstance(tasks, list) and len(tasks) > 0 and isinstance(tasks[0], list):
+        return tasks[0]
+    return tasks
+
+
+# ------------------------------------------------------------
+# MAIN
 # ------------------------------------------------------------
 @hydra.main(config_path="config/format", config_name="compute_representations_fv")
 def run(args: DictConfig):
@@ -101,9 +80,9 @@ def run(args: DictConfig):
     model_dtype = next(model.parameters()).dtype
 
     # ----------------------------
-    # data
+    # DATA
     # ----------------------------
-    tasks = args.tasks if isinstance(args.tasks, list) else [args.tasks]
+    tasks = normalize_tasks(args.tasks)
 
     dfs = []
     for t in tasks:
@@ -111,7 +90,7 @@ def run(args: DictConfig):
 
     data = pd.concat(dfs, ignore_index=True)
 
-    # subset
+    # subset / dry run
     if args.use_data_subset:
         data = data.sample(frac=float(args.data_subset_ratio), random_state=42)
 
@@ -119,7 +98,7 @@ def run(args: DictConfig):
         data = data.head(5)
 
     # ----------------------------
-    # steering vector (PLACEHOLDER)
+    # STEERING VECTOR (placeholder)
     # ----------------------------
     hidden = model.config.hidden_size
 
@@ -127,9 +106,8 @@ def run(args: DictConfig):
     steering_vector[:10] = 1.0
     steering_vector = steering_vector.unsqueeze(0).unsqueeze(0)
 
-    # layer selection
+    # layers
     n_layers = model.config.num_hidden_layers
-
     steer_layers = {
         "baseline": None,
         "l25": int(n_layers * 0.25),
@@ -140,7 +118,7 @@ def run(args: DictConfig):
     print("Steering layers:", steer_layers)
 
     # ----------------------------
-    # eval loop
+    # LOOP
     # ----------------------------
     results = []
 
@@ -156,18 +134,13 @@ def run(args: DictConfig):
         # baseline
         row["baseline"] = generate(model, tokenizer, prompt, args.device)
 
-        # steering runs
+        # steering
         for label, layer in steer_layers.items():
 
             if layer is None:
                 continue
 
-            handle = add_steering_hook(
-                model,
-                layer,
-                steering_vector,
-                alpha=1.0
-            )
+            handle = add_steering_hook(model, layer, steering_vector, alpha=1.0)
 
             out = generate(model, tokenizer, prompt, args.device)
 
@@ -180,7 +153,7 @@ def run(args: DictConfig):
     df = pd.DataFrame(results)
 
     # ----------------------------
-    # save
+    # SAVE
     # ----------------------------
     if not args.dry_run:
         out_dir = os.path.join(
