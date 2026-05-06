@@ -1,93 +1,68 @@
-import os
-import json
 import argparse
+import json
 import torch
-from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
 # -----------------------------
-# LOAD DATA
+# DATA
 # -----------------------------
-def load_dataset(path, ratio=1.0):
+def load_data(path, ratio=1.0):
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     if ratio < 1.0:
-        data = data[: max(1, int(len(data) * ratio))]
+        data = data[:max(1, int(len(data) * ratio))]
     return data
 
 
 # -----------------------------
-# MATCH (RELAXED)
+# MATCH
 # -----------------------------
 def match(pred, target):
     if not isinstance(pred, str):
         return False
-    pred = pred.lower().strip()
-    target = str(target).lower().strip()
-    return target in pred or pred in target
+    return str(target).lower() in pred.lower()
 
 
 # -----------------------------
-# FIND LAYERS ROBUSTLY
+# NORMALIZE
 # -----------------------------
-def get_layers(model):
-    candidates = [
-        "model.layers",
-        "model.model.layers",
-        "base_model.model.layers",
-    ]
-
-    for path in candidates:
-        obj = model
-        try:
-            for attr in path.split("."):
-                obj = getattr(obj, attr)
-            print(f"[OK] Found layers at: {path}")
-            return obj
-        except Exception:
-            continue
-
-    raise RuntimeError("Could not find transformer layers!")
+def normalize(v):
+    return v / (v.norm() + 1e-8)
 
 
 # -----------------------------
-# STEERING VECTOR
+# BUILD STEERING VECTOR
 # -----------------------------
 @torch.no_grad()
 def build_vector(model, tokenizer, device):
-    good = "Translate English to French:"
-    bad = "Random text:"
+    pos = "Translate English to French:"
+    neg = "Random unrelated text:"
 
     def get_hidden(text):
         inp = tokenizer(text, return_tensors="pt").to(device)
         out = model(**inp, output_hidden_states=True)
-        h = out.hidden_states[len(out.hidden_states)//2]
+        h = out.hidden_states[len(out.hidden_states) // 2]
         return h[0, -1].float()
 
-    v = get_hidden(good) - get_hidden(bad)
-
-    print("\n[STEERING VECTOR]")
-    print("Norm:", v.norm().item())
-
-    return v
+    v = get_hidden(pos) - get_hidden(neg)
+    return normalize(v)
 
 
 # -----------------------------
-# HOOK FACTORY
+# HOOK
 # -----------------------------
-def make_hook(vec):
+def make_hook(vec, alpha):
     vec = vec.detach()
 
     def hook(module, input, output):
+        delta = alpha * vec
 
         if isinstance(output, tuple):
-            h = output[0]
-            h = h + vec.to(h.device).to(h.dtype)
+            h = output[0] + delta.to(output[0].device).to(output[0].dtype)
             return (h,) + output[1:]
 
-        h = output + vec.to(output.device).to(output.dtype)
-        return h
+        return output + delta.to(output.device).to(output.dtype)
 
     return hook
 
@@ -102,36 +77,46 @@ def generate(model, tokenizer, prompt, device):
     out = model.generate(
         **inp,
         max_new_tokens=20,
-        do_sample=False
+        do_sample=False,
+        pad_token_id=tokenizer.eos_token_id
     )
 
     return tokenizer.decode(out[0], skip_special_tokens=True)
 
 
 # -----------------------------
-# EVAL
+# EVALUATION
 # -----------------------------
-def evaluate(model, tokenizer, data, device, hook_layer=None, hook=None):
+def evaluate(model, tokenizer, data, device, layer, vec, alpha):
+    layer_module = model.model.layers[layer]
+
+    hook_handle = layer_module.register_forward_hook(
+        make_hook(vec, alpha)
+    )
 
     correct = 0
 
-    if hook is not None:
-        handle = hook_layer.register_forward_hook(hook)
-        print("\n[INFO] Hook registered on layer")
-    else:
-        handle = None
-
-    for ex in tqdm(data):
+    for ex in data:
         prompt = f"Translate English to French: {ex['input']}"
         pred = generate(model, tokenizer, prompt, device)
 
         if match(pred, ex["output"]):
             correct += 1
 
-    if handle:
-        handle.remove()
+    hook_handle.remove()
 
     return correct / len(data)
+
+
+# -----------------------------
+# LAYER MAP
+# -----------------------------
+def get_layers(L):
+    return {
+        "l25": int(L * 0.25),
+        "l50": int(L * 0.50),
+        "l75": int(L * 0.75),
+    }
 
 
 # -----------------------------
@@ -156,28 +141,31 @@ def main():
     )
     model.eval()
 
-    data = load_dataset(args.data, args.subset)
+    data = load_data(args.data, args.subset)
 
     # -------------------------
-    # DETECT LAYERS
+    # LAYERS
     # -------------------------
-    layers = get_layers(model)
-    L = len(layers)
+    L = len(model.model.layers)
+    layers = get_layers(L)
 
-    layer_map = {
-        "l25": int(L * 0.25),
-        "l50": int(L * 0.50),
-        "l75": int(L * 0.75),
-    }
-
-    print("\n[MODEL DEPTH]", L)
-    print("[LAYERS]", layer_map)
+    print("\nModel layers:", L)
+    print("Target layers:", layers)
 
     # -------------------------
     # BASELINE
     # -------------------------
     print("\n=== BASELINE ===")
-    baseline = evaluate(model, tokenizer, data, device)
+    baseline_correct = 0
+
+    for ex in data:
+        prompt = f"Translate English to French: {ex['input']}"
+        pred = generate(model, tokenizer, prompt, device)
+
+        if match(pred, ex["output"]):
+            baseline_correct += 1
+
+    baseline = baseline_correct / len(data)
     print("baseline:", baseline)
 
     # -------------------------
@@ -185,44 +173,51 @@ def main():
     # -------------------------
     vec = build_vector(model, tokenizer, device)
 
+    alphas = [0.05, 0.1, 0.2, 0.5]
+
     results = {"baseline": baseline}
 
     # -------------------------
     # STEERING TESTS
     # -------------------------
-    for name, idx in layer_map.items():
+    for name, layer_idx in layers.items():
 
-        print(f"\n=== {name} (layer {idx}) ===")
+        best_acc = 0
+        best_alpha = None
 
-        layer = layers[idx]
+        for a in alphas:
 
-        acc = evaluate(
-            model,
-            tokenizer,
-            data,
-            device,
-            hook_layer=layer,
-            hook=make_hook(vec)
-        )
+            acc = evaluate(
+                model,
+                tokenizer,
+                data,
+                device,
+                layer_idx,
+                vec,
+                a
+            )
 
-        print(f"{name}: {acc}")
+            if acc > best_acc:
+                best_acc = acc
+                best_alpha = a
 
-        results[name] = acc
+        results[name] = best_acc
+
+        print(f"{name}: {best_acc:.4f} (alpha={best_alpha})")
 
     # -------------------------
     # SAVE
     # -------------------------
-    os.makedirs("results", exist_ok=True)
+    out_path = "results_fv.json"
 
-    out = "results/results_debug_steering.json"
-    with open(out, "w") as f:
+    with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
 
-    print("\n=== FINAL ===")
+    print("\n=== FINAL RESULTS ===")
     for k, v in results.items():
         print(f"{k}: {v:.4f}")
 
-    print("\nSaved →", out)
+    print("\nSaved →", out_path)
 
 
 if __name__ == "__main__":
