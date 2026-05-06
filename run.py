@@ -6,7 +6,7 @@ import tqdm
 import torch
 import hydra
 from omegaconf import DictConfig, OmegaConf
-
+from compute_representations_fv import load_fv_dataset
 from utils.model_utils import load_model_from_tl_name
 from utils.generation_utils import generate
 
