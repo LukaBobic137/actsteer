@@ -6,10 +6,7 @@ transformers_cache_dir: null   # ili npr. "/scratch/hf_cache" ako imaš custom p
 # Tasks
 tasks:
   - english_french
-  - synonyms
-  - antonyms
-  - country_capital
-  - person_sport
+  - english_german
 
 # Lokalni dataset (null = skida s GitHuba automatski)
 fv_local_data_dir: null
