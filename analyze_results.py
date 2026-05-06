@@ -1,6 +1,6 @@
 import pandas as pd
 
-PATH = "steering_results/meta-llama_Meta-Llama-3-8B-Instruct/results.csv"
+PATH = "steering_results/meta-llama_Meta-Llama-3-8B-Instruct/results_fv.csv"
 
 df = pd.read_csv(PATH)
 
