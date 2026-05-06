@@ -106,7 +106,7 @@ def build_zero_shot_prompt(task_name: str, input_word: str) -> str:
 def build_few_shot_prompt(
     task_name: str,
     input_word: str,
-    few_shot_examples: list[dict],   # list of {"input": ..., "output": ...}
+    few_shot_examples: list,   # list of {"input": ..., "output": ...}
 ) -> str:
     """Build a k-shot prompt by prepending examples to the zero-shot template."""
     template = PROMPT_TEMPLATES[task_name]
@@ -132,7 +132,7 @@ def build_few_shot_prompt(
 # Layer-index helpers
 # ---------------------------------------------------------------------------
 
-def get_depth_layer_indices(num_layers: int) -> dict[str, int]:
+def get_depth_layer_indices(num_layers: int) -> dict:
     """Return layer indices at 25 %, 50 %, and 75 % of total model depth."""
     return {
         "layer_25pct": max(0, round(num_layers * 0.25) - 1),
