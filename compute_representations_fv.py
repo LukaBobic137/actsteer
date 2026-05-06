@@ -30,12 +30,8 @@ FV_DATASET_BASE = "https://raw.githubusercontent.com/ericwtodd/function_vectors/
 # Datasets from Appendix E that we care about.
 # Each entry maps a short task name → the JSON filename in the FV repo.
 FV_DATASETS = {
-    "english_french":    "abstractive/english-french.json",
-    "english_german":    "abstractive/english-german.json",
-    "synonyms":          "abstractive/synonym.json",
-    "antonyms":          "abstractive/antonym.json",
-    "country_capital":   "extractive/country_capital.json",
-    "person_sport":      "extractive/person_sport.json",
+    "english_french": "abstractive/english-french.json",
+    "english_german": "abstractive/english-german.json",
 }
 
 
