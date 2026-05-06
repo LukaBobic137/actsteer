@@ -77,7 +77,15 @@ def run(args: DictConfig):
     # -----------------------
     # data
     # -----------------------
-    data = load_data(args.data_path, limit=5 if args.dry_run else None)
+    # FV dataset loading (correct version)
+    local_dir = args.get("fv_local_data_dir", None)
+
+    task_dfs = []
+    for task in args.tasks:
+        df = load_fv_dataset(task, local_dir)
+        task_dfs.append(df)
+
+    data = pd.concat(task_dfs)
 
     # -----------------------
     # STEERING SETUP
