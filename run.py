@@ -35,7 +35,7 @@ def load_data(path, limit=None):
 # PROMPT
 # ------------------------------------------------------------
 def build_prompt(r, tokenizer):
-    messages = [{"role": "user", "content": r["prompt"]}]
+    messages = [{"role": "user", "content": r["input"]}]
     return tokenizer.apply_chat_template(
         messages,
         add_generation_prompt=True,
