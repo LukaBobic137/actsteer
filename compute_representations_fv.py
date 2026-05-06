@@ -25,10 +25,7 @@ config_path = os.path.join(project_dir, 'config/format')
 # ---------------------------------------------------------------------------
 
 # Raw GitHub base URL for the Function Vectors dataset files
-FV_DATASET_BASE = (
-    "https://raw.githubusercontent.com/ericwtodd/function_vectors/"
-    "main/dataset_files"
-)
+FV_DATASET_BASE = "https://raw.githubusercontent.com/ericwtodd/function_vectors/master/dataset_files"
 
 # Datasets from Appendix E that we care about.
 # Each entry maps a short task name → the JSON filename in the FV repo.
