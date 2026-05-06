@@ -1,0 +1,31 @@
+# Model
+model_name: "meta-llama/Meta-Llama-3-8B-Instruct"
+device: "cuda"
+transformers_cache_dir: null   # ili npr. "/scratch/hf_cache" ako imaš custom path
+
+# Tasks
+tasks:
+  - english_french
+  - synonyms
+  - antonyms
+  - country_capital
+  - person_sport
+
+# Lokalni dataset (null = skida s GitHuba automatski)
+fv_local_data_dir: null
+
+# Few-shot (0 = zero-shot)
+num_shots: 0
+
+# Koliko zadnjih tokena uzeti za reprezentaciju
+num_final_tokens: 1
+
+# Generiranje
+max_generation_length: 20
+
+# Subset (za testiranje)
+use_data_subset: false
+data_subset_ratio: 0.1
+
+# Dry run (5 primjera, ne sprema)
+dry_run: false

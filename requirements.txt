@@ -1,0 +1,10 @@
+torch
+transformers
+transformer_lens
+omegaconf
+hydra-core
+tqdm
+pandas
+tables        
+requests
+numpy

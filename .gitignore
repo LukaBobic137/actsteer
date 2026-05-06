@@ -1,16 +1,43 @@
-stored_hs/
-hf_token.txt
+# Python
 __pycache__/
-*.pyc
-packages-microsoft*
-.vscode/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.env
+venv/
+.venv/
+
+# HuggingFace / model weights
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+hf_cache/
+transformers_cache/
+
+# Outputs / rezultati
+representations_fv/
+outputs/
+multirun/
+
+# Hydra
+.hydra/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Data (HDF5, CSV outputi)
+*.h5
+*.hdf5
+
+# OS
 .DS_Store
-*.download
-*.zip
-nuget.config
-*/layer_search_out_old
-*/out_old
-*/out
-*/representations
-*/representations_old/
-find_best_layer_test.sh
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
