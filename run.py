@@ -1,124 +1,166 @@
 import os
+import json
 import argparse
 import torch
 from tqdm import tqdm
-
-from utils.fv_dataset_loader import load_fv_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
-# -----------------------------
-# ARGPARSE
-# -----------------------------
-def parse_args():
-    parser = argparse.ArgumentParser()
+# ----------------------------
+# DATA LOADER
+# ----------------------------
+def load_dataset(path, subset_ratio=1.0):
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-    parser.add_argument("--model_name", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct")
-    parser.add_argument("--data_dir", type=str, default="dataset_files")
-    parser.add_argument("--use_subset", type=bool, default=True)
-    parser.add_argument("--subset_ratio", type=float, default=0.1)
+    if subset_ratio < 1.0:
+        n = max(1, int(len(data) * subset_ratio))
+        data = data[:n]
 
-    return parser.parse_args()
-
-
-# -----------------------------
-# SIMPLE MATCHING (REALISTIC)
-# -----------------------------
-def is_correct(pred, target):
-    pred = pred.lower().strip()
-    target = target.lower().strip()
-
-    return target in pred or pred.split()[0] == target.split()[0]
+    return data
 
 
-# -----------------------------
+# ----------------------------
+# STEERING VECTOR (simple version)
+# ----------------------------
+@torch.no_grad()
+def build_dummy_steering_vector(model, tokenizer, device):
+    """
+    NOTE:
+    This is a placeholder.
+    Real version = mean(good activations - bad activations)
+
+    For now we use a small learned proxy:
+    direction from random prompts.
+    """
+
+    text_good = "translate English to French:"
+    text_bad = "random text generation task:"
+
+    def get_activation(text):
+        inputs = tokenizer(text, return_tensors="pt").to(device)
+
+        outs = model(**inputs, output_hidden_states=True)
+        # take middle layer
+        h = outs.hidden_states[len(outs.hidden_states) // 2]
+        return h[0, -1, :].float()
+
+    v = get_activation(text_good) - get_activation(text_bad)
+    return v
+
+
+# ----------------------------
+# HOOK FACTORY
+# ----------------------------
+def get_hook(steering_vector, alpha=0.8):
+    steering_vector = steering_vector.detach()
+
+    def hook(module, input, output):
+        # output: (batch, seq, hidden)
+        if isinstance(output, tuple):
+            hidden = output[0]
+            hidden = hidden + alpha * steering_vector.to(hidden.device).to(hidden.dtype)
+            return (hidden,) + output[1:]
+        else:
+            return output + alpha * steering_vector.to(output.device).to(output.dtype)
+
+    return hook
+
+
+# ----------------------------
 # GENERATION
-# -----------------------------
-def generate(model, tokenizer, text, device):
+# ----------------------------
+@torch.no_grad()
+def generate(model, tokenizer, text, device, max_new_tokens=20):
     inputs = tokenizer(text, return_tensors="pt").to(device)
 
-    with torch.no_grad():
-        out = model.generate(
-            **inputs,
-            max_new_tokens=20,
-            do_sample=False,
-            temperature=0.0
-        )
+    out = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=False
+    )
 
     return tokenizer.decode(out[0], skip_special_tokens=True)
 
 
-# -----------------------------
-# EVAL
-# -----------------------------
-def evaluate(model, tokenizer, dataset, device):
-    correct = 0
-    total = 0
-
-    results = []
-
-    for ex in tqdm(dataset):
-        prompt = ex["input"]
-        target = ex["target"]
-
-        pred = generate(model, tokenizer, prompt, device)
-
-        ok = is_correct(pred, target)
-
-        correct += int(ok)
-        total += 1
-
-        results.append({
-            "input": prompt,
-            "target": target,
-            "pred": pred,
-            "correct": ok
-        })
-
-    acc = correct / max(total, 1)
-
-    return acc, results
+# ----------------------------
+# MATCHING (simple eval)
+# ----------------------------
+def match(pred, target):
+    if not isinstance(pred, str):
+        return False
+    return pred.strip().lower().split()[0] == target.strip().lower().split()[0]
 
 
-# -----------------------------
+# ----------------------------
 # MAIN
-# -----------------------------
+# ----------------------------
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default="meta-llama/Meta-Llama-3-8B-Instruct")
+    parser.add_argument("--data", default="dataset_files/english-french.json")
+    parser.add_argument("--subset_ratio", type=float, default=0.01)
+    parser.add_argument("--alpha", type=float, default=0.8)
+    args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    print(f"Loading model: {args.model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    # load model
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(
-        args.model_name,
+        args.model,
         torch_dtype=torch.float16 if device == "cuda" else torch.float32,
         device_map="auto"
     )
 
-    tasks = ["english-french", "english-german", "english-spanish"]
+    model.eval()
 
-    print("Loading dataset...")
-    dataset = load_fv_dataset(args.data_dir, tasks)
+    # load data
+    data = load_dataset(args.data, args.subset_ratio)
 
-    if args.use_subset:
-        dataset = dataset[: int(len(dataset) * args.subset_ratio)]
+    # build steering vector
+    steering_vector = build_dummy_steering_vector(model, tokenizer, device)
 
-    print(f"Dataset size: {len(dataset)}")
+    # choose layer (middle layer heuristic)
+    layer_id = len(model.model.layers) // 2
+    target_layer = model.model.layers[layer_id]
 
-    print("Running evaluation...")
-    acc, results = evaluate(model, tokenizer, dataset, device)
+    # register hook
+    hook = target_layer.register_forward_hook(
+        get_hook(steering_vector, args.alpha)
+    )
+
+    results = []
+    correct = 0
+
+    for ex in tqdm(data):
+        inp = ex["input"]
+        tgt = ex["output"] if "output" in ex else ex["target"]
+
+        prompt = f"Translate English to French: {inp}"
+
+        pred = generate(model, tokenizer, prompt, device)
+
+        ok = match(pred, tgt)
+        correct += int(ok)
+
+        results.append({
+            "input": inp,
+            "target": tgt,
+            "pred": pred,
+            "correct": ok
+        })
+
+    hook.remove()
+
+    acc = correct / len(data)
 
     print("\n=== RESULTS ===")
     print(f"Accuracy: {acc:.4f}")
 
-    # save
-    out_path = "results_fv.json"
-    import json
-    with open(out_path, "w") as f:
+    os.makedirs("results", exist_ok=True)
+    with open("results/results_fv.json", "w") as f:
         json.dump(results, f, indent=2)
-
-    print(f"Saved → {out_path}")
 
 
 if __name__ == "__main__":
