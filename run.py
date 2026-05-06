@@ -5,9 +5,9 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
 # -----------------------------
-# DATA
+# LOAD JSON
 # -----------------------------
-def load_data(path, ratio=1.0):
+def load_json(path, ratio=1.0):
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     if ratio < 1.0:
@@ -25,28 +25,48 @@ def match(pred, target):
 
 
 # -----------------------------
-# NORMALIZE
+# CORRUPT (BAD EXAMPLES)
 # -----------------------------
-def normalize(v):
-    return v / (v.norm() + 1e-8)
+def corrupt(text):
+    words = text.split()
+    if len(words) > 1:
+        words = words[::-1]  # reverse
+    return " ".join(words)
 
 
 # -----------------------------
-# BUILD STEERING VECTOR
+# GET HIDDEN STATE
 # -----------------------------
 @torch.no_grad()
-def build_vector(model, tokenizer, device):
-    pos = "Translate English to French:"
-    neg = "Random unrelated text:"
+def get_hidden(model, tokenizer, text, device):
+    inp = tokenizer(text, return_tensors="pt").to(device)
+    out = model(**inp, output_hidden_states=True)
+    h = out.hidden_states[len(out.hidden_states)//2]
+    return h[0, -1].float()
 
-    def get_hidden(text):
-        inp = tokenizer(text, return_tensors="pt").to(device)
-        out = model(**inp, output_hidden_states=True)
-        h = out.hidden_states[len(out.hidden_states) // 2]
-        return h[0, -1].float()
 
-    v = get_hidden(pos) - get_hidden(neg)
-    return normalize(v)
+# -----------------------------
+# CONTRASTIVE VECTOR
+# -----------------------------
+@torch.no_grad()
+def build_vector(model, tokenizer, data, device):
+
+    good_vecs = []
+    bad_vecs = []
+
+    for ex in data:
+
+        good_text = f"Translate English to French: {ex['input']}"
+        bad_text = corrupt(good_text)
+
+        good_vecs.append(get_hidden(model, tokenizer, good_text, device))
+        bad_vecs.append(get_hidden(model, tokenizer, bad_text, device))
+
+    mu_good = torch.stack(good_vecs).mean(0)
+    mu_bad = torch.stack(bad_vecs).mean(0)
+
+    v = mu_good - mu_bad
+    return v / (v.norm() + 1e-8)
 
 
 # -----------------------------
@@ -68,7 +88,7 @@ def make_hook(vec, alpha):
 
 
 # -----------------------------
-# GENERATION
+# GENERATE
 # -----------------------------
 @torch.no_grad()
 def generate(model, tokenizer, prompt, device):
@@ -85,31 +105,30 @@ def generate(model, tokenizer, prompt, device):
 
 
 # -----------------------------
-# EVALUATION
+# EVAL
 # -----------------------------
-def evaluate(model, tokenizer, data, device, layer, vec, alpha):
-    layer_module = model.model.layers[layer]
+def evaluate(model, tokenizer, data, device, layer, vec, alpha, prompt_prefix):
 
-    hook_handle = layer_module.register_forward_hook(
+    hook = model.model.layers[layer].register_forward_hook(
         make_hook(vec, alpha)
     )
 
     correct = 0
 
     for ex in data:
-        prompt = f"Translate English to French: {ex['input']}"
+        prompt = f"{prompt_prefix}: {ex['input']}"
         pred = generate(model, tokenizer, prompt, device)
 
         if match(pred, ex["output"]):
             correct += 1
 
-    hook_handle.remove()
+    hook.remove()
 
     return correct / len(data)
 
 
 # -----------------------------
-# LAYER MAP
+# LAYERS
 # -----------------------------
 def get_layers(L):
     return {
@@ -122,12 +141,57 @@ def get_layers(L):
 # -----------------------------
 # MAIN
 # -----------------------------
+def run_task(model, tokenizer, device, data, name, vec, layers):
+
+    print(f"\n================ {name.upper()} ================")
+
+    prompt_map = {
+        "translation": "Translate English to French",
+        "synonym": "Find synonym",
+        "antonym": "Find antonym"
+    }
+
+    results = {}
+
+    baseline_correct = 0
+
+    for ex in data:
+        prompt = f"{prompt_map[name]}: {ex['input']}"
+        pred = generate(model, tokenizer, prompt, device)
+        if match(pred, ex["output"]):
+            baseline_correct += 1
+
+    baseline = baseline_correct / len(data)
+    results["baseline"] = baseline
+
+    print("baseline:", baseline)
+
+    alphas = [0.05, 0.1, 0.2]
+
+    for lname, layer_idx in layers.items():
+
+        best = 0
+
+        for a in alphas:
+            acc = evaluate(
+                model, tokenizer, data,
+                device, layer_idx, vec, a,
+                prompt_map[name]
+            )
+
+            best = max(best, acc)
+
+        results[lname] = best
+        print(f"{lname}: {best:.4f}")
+
+    return results
+
+
 def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="meta-llama/Meta-Llama-3-8B-Instruct")
-    parser.add_argument("--data", default="dataset_files/english-french.json")
-    parser.add_argument("--subset", type=float, default=0.01)
+    parser.add_argument("--subset", type=float, default=0.1)
 
     args = parser.parse_args()
 
@@ -141,83 +205,48 @@ def main():
     )
     model.eval()
 
-    data = load_data(args.data, args.subset)
+    # -----------------------------
+    # DATASETS
+    # -----------------------------
+    translation = load_json("dataset_files/english-french.json", args.subset)
+    synonym = load_json("dataset_files/synonym.json", args.subset)
+    antonym = load_json("dataset_files/antonym.json", args.subset)
 
-    # -------------------------
-    # LAYERS
-    # -------------------------
     L = len(model.model.layers)
     layers = get_layers(L)
 
-    print("\nModel layers:", L)
-    print("Target layers:", layers)
+    # -----------------------------
+    # VECTOR (FROM TRANSLATION ONLY)
+    # -----------------------------
+    vec = build_vector(model, tokenizer, translation, device)
 
-    # -------------------------
-    # BASELINE
-    # -------------------------
-    print("\n=== BASELINE ===")
-    baseline_correct = 0
+    all_results = {}
 
-    for ex in data:
-        prompt = f"Translate English to French: {ex['input']}"
-        pred = generate(model, tokenizer, prompt, device)
+    all_results["translation"] = run_task(
+        model, tokenizer, device,
+        translation, "translation",
+        vec, layers
+    )
 
-        if match(pred, ex["output"]):
-            baseline_correct += 1
+    all_results["synonym"] = run_task(
+        model, tokenizer, device,
+        synonym, "synonym",
+        vec, layers
+    )
 
-    baseline = baseline_correct / len(data)
-    print("baseline:", baseline)
+    all_results["antonym"] = run_task(
+        model, tokenizer, device,
+        antonym, "antonym",
+        vec, layers
+    )
 
-    # -------------------------
-    # STEERING VECTOR
-    # -------------------------
-    vec = build_vector(model, tokenizer, device)
-
-    alphas = [0.05, 0.1, 0.2, 0.5]
-
-    results = {"baseline": baseline}
-
-    # -------------------------
-    # STEERING TESTS
-    # -------------------------
-    for name, layer_idx in layers.items():
-
-        best_acc = 0
-        best_alpha = None
-
-        for a in alphas:
-
-            acc = evaluate(
-                model,
-                tokenizer,
-                data,
-                device,
-                layer_idx,
-                vec,
-                a
-            )
-
-            if acc > best_acc:
-                best_acc = acc
-                best_alpha = a
-
-        results[name] = best_acc
-
-        print(f"{name}: {best_acc:.4f} (alpha={best_alpha})")
-
-    # -------------------------
+    # -----------------------------
     # SAVE
-    # -------------------------
-    out_path = "results_fv.json"
+    # -----------------------------
+    with open("results_fv.json", "w") as f:
+        json.dump(all_results, f, indent=2)
 
-    with open(out_path, "w") as f:
-        json.dump(results, f, indent=2)
-
-    print("\n=== FINAL RESULTS ===")
-    for k, v in results.items():
-        print(f"{k}: {v:.4f}")
-
-    print("\nSaved →", out_path)
+    print("\nDONE → results_fv.json")
 
 
 if __name__ == "__main__":
