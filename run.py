@@ -59,7 +59,7 @@ def add_steering_hook(model, layer_idx, steering_vector, alpha=1.0):
 # ------------------------------------------------------------
 # MAIN
 # ------------------------------------------------------------
-@hydra.main(config_path=config_path, config_name="compute_representations")
+@hydra.main(config_path=config_path, config_name="compute_representations_fv")
 def run(args: DictConfig):
 
     print(OmegaConf.to_yaml(args))
