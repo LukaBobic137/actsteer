@@ -40,44 +40,34 @@ FV_DATASETS = {
 
 
 def load_fv_dataset(task_name: str, local_data_dir: Optional[str] = None) -> pd.DataFrame:
-    """Load a Function Vectors dataset.
-
-    Tries a local directory first (useful if you've already cloned the repo),
-    then falls back to downloading directly from GitHub.
-
-    Each JSON file in the FV repo has the structure:
-        {"input": [...], "output": [...]}
-    where input[i] / output[i] are the i-th example pair.
-
-    Returns a DataFrame with columns: task, input, output.
-    """
     filename = FV_DATASETS[task_name]
 
     data = None
 
-    # 1. Try local file
+    # load
     if local_data_dir:
         local_path = os.path.join(local_data_dir, filename)
         if os.path.exists(local_path):
             with open(local_path) as f:
                 data = json.load(f)
 
-    # 2. Fall back to GitHub
     if data is None:
         url = f"{FV_DATASET_BASE}/{filename}"
         resp = requests.get(url, timeout=30)
         resp.raise_for_status()
         data = resp.json()
 
-    inputs  = data["input"]
-    outputs = data["output"]
-    assert len(inputs) == len(outputs), "Mismatch between inputs and outputs"
+    # 🔥 FIX: handle list format
+    if isinstance(data, list):
+        inputs = [x["input"] for x in data]
+        outputs = [x["output"] for x in data]
+    else:
+        inputs = data["input"]
+        outputs = data["output"]
 
     df = pd.DataFrame({"input": inputs, "output": outputs})
     df.insert(0, "task", task_name)
     return df
-
-
 # ---------------------------------------------------------------------------
 # Prompt builders
 # ---------------------------------------------------------------------------
