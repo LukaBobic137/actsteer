@@ -80,7 +80,6 @@ def make_hook(vec):
     vec = vec.detach()
 
     def hook(module, input, output):
-        print("[HOOK] ACTIVE")
 
         if isinstance(output, tuple):
             h = output[0]
@@ -143,7 +142,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="meta-llama/Meta-Llama-3-8B-Instruct")
     parser.add_argument("--data", default="dataset_files/english-french.json")
-    parser.add_argument("--subset", type=float, default=0.01)
+    parser.add_argument("--subset", type=float, default=0.05)
 
     args = parser.parse_args()
 
