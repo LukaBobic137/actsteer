@@ -4,13 +4,15 @@ import json
 import pandas as pd
 import tqdm
 import torch
-from omegaconf import DictConfig, OmegaConf
 import hydra
+from omegaconf import DictConfig, OmegaConf
 
-from compute_representations_fv import load_fv_dataset
 from utils.model_utils import load_model_from_tl_name
 from utils.generation_utils import generate
 
+# ------------------------------------------------------------
+# setup
+# ------------------------------------------------------------
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_dir = script_dir
 os.chdir(project_dir)
@@ -20,10 +22,38 @@ config_path = os.path.join(project_dir, "config/format")
 
 
 # ------------------------------------------------------------
-# PROMPT
+# prompt templates (FIXED: constrained outputs)
 # ------------------------------------------------------------
-def build_prompt(r, tokenizer):
-    messages = [{"role": "user", "content": r["input"]}]
+PROMPT_TEMPLATES = {
+    "english_french":
+        "Translate to French.\nReturn ONLY ONE WORD.\nEnglish: {input}\nFrench:",
+
+    "english_german":
+        "Translate to German.\nReturn ONLY ONE WORD.\nEnglish: {input}\nGerman:",
+
+    "synonyms":
+        "Give ONE synonym.\nReturn ONLY ONE WORD.\nWord: {input}\nSynonym:",
+
+    "antonyms":
+        "Give ONE antonym.\nReturn ONLY ONE WORD.\nWord: {input}\nAntonym:",
+}
+
+
+# ------------------------------------------------------------
+# utils
+# ------------------------------------------------------------
+def normalize(x):
+    return str(x).strip().lower()
+
+
+def exact_match(pred, target):
+    if not isinstance(pred, str):
+        return False
+    return normalize(pred) == normalize(target)
+
+
+def build_prompt(r, tokenizer, task):
+    messages = [{"role": "user", "content": PROMPT_TEMPLATES[task].format(input=r["input"])}]
     return tokenizer.apply_chat_template(
         messages,
         add_generation_prompt=True,
@@ -32,23 +62,20 @@ def build_prompt(r, tokenizer):
 
 
 # ------------------------------------------------------------
-# STEERING HOOK
+# steering hook
 # ------------------------------------------------------------
 def add_steering_hook(model, layer_idx, steering_vector, alpha=1.0):
 
     def hook_fn(module, input, output):
         h = output[0]
-
-        # FIX: dtype + device alignment (CRITICAL)
-        h = h + alpha * steering_vector.to(h.device).to(h.dtype)
-
+        h = h + alpha * steering_vector.to(h.device)
         return (h,) + output[1:]
 
     return model.model.layers[layer_idx].register_forward_hook(hook_fn)
 
 
 # ------------------------------------------------------------
-# MAIN
+# main
 # ------------------------------------------------------------
 @hydra.main(config_path=config_path, config_name="compute_representations_fv")
 def run(args: DictConfig):
@@ -56,7 +83,7 @@ def run(args: DictConfig):
     print(OmegaConf.to_yaml(args))
 
     # -----------------------
-    # MODEL
+    # model
     # -----------------------
     model, tokenizer = load_model_from_tl_name(
         args.model_name,
@@ -66,71 +93,74 @@ def run(args: DictConfig):
     model.eval()
 
     # -----------------------
-    # DATA
+    # load data
     # -----------------------
     local_dir = args.get("fv_local_data_dir", None)
 
     dfs = []
     for task in args.tasks:
-        dfs.append(load_fv_dataset(task, local_dir))
+        df = load_fv_dataset(task, local_dir)
+        df["task"] = task
+        dfs.append(df)
 
-    data = pd.concat(dfs).reset_index(drop=True)
+    data = pd.concat(dfs)
 
+    # shuffle (IMPORTANT FIX)
+    data = data.sample(frac=1, random_state=42).reset_index(drop=True)
+
+    # subset / dry run
     if args.get("use_data_subset", False):
-        ratio = float(args.get("data_subset_ratio", 0.1))
-        data = data.iloc[:max(1, int(len(data) * ratio))]
+        data = data.head(int(len(data) * args.data_subset_ratio))
 
     if args.get("dry_run", False):
         data = data.head(5)
 
     # -----------------------
-    # STEERING VECTOR (placeholder)
+    # steering vector (placeholder)
     # -----------------------
     hidden_size = model.config.hidden_size
-
-    steering_vector = torch.zeros(hidden_size, dtype=torch.float16)
+    steering_vector = torch.zeros(hidden_size)
     steering_vector[:10] = 1.0
-    steering_vector = steering_vector.view(1, 1, -1)
+    steering_vector = steering_vector.unsqueeze(0).unsqueeze(0)
 
-    # -----------------------
-    # LAYERS
-    # -----------------------
-    n_layers = model.config.num_hidden_layers
-
+    layers = model.config.num_hidden_layers
     steer_layers = {
         "baseline": None,
-        "l25": int(n_layers * 0.25),
-        "l50": int(n_layers * 0.50),
-        "l75": int(n_layers * 0.75),
+        "l25": int(layers * 0.25),
+        "l50": int(layers * 0.50),
+        "l75": int(layers * 0.75),
     }
 
     print("Steering layers:", steer_layers)
 
     # -----------------------
-    # LOOP
+    # run
     # -----------------------
     results = []
     pbar = tqdm.tqdm(total=len(data))
 
     for _, r in data.iterrows():
 
-        prompt = build_prompt(r, tokenizer)
+        task = r["task"]
+        prompt = build_prompt(r, tokenizer, task)
 
         row = {
             "input": r["input"],
-            "target": r.get("output", "")
+            "target": r["output"],
+            "task": task
         }
 
         # -----------------------
-        # BASELINE
+        # baseline
         # -----------------------
-        row["baseline"] = generate(
+        baseline = generate(
             model, tokenizer, prompt, args.device,
             max_new_tokens=args.max_generation_length
         )
+        row["baseline"] = baseline
 
         # -----------------------
-        # STEERED RUNS
+        # steering runs
         # -----------------------
         for label, layer in steer_layers.items():
 
@@ -151,7 +181,7 @@ def run(args: DictConfig):
 
             handle.remove()
 
-            row[f"{label}_output"] = out
+            row[label] = out
 
         results.append(row)
         pbar.update(1)
@@ -161,20 +191,33 @@ def run(args: DictConfig):
     df = pd.DataFrame(results)
 
     # -----------------------
-    # SAVE
+    # evaluation (FIXED)
+    # -----------------------
+    print("\n=== Accuracy ===")
+    for col in ["baseline", "l25", "l50", "l75"]:
+        acc = df.apply(lambda r: exact_match(r[col], r["target"]), axis=1).mean()
+        print(f"{col}: {acc:.3f}")
+
+    print("\n=== Change rate vs baseline ===")
+    for col in ["l25", "l50", "l75"]:
+        change = (df["baseline"] != df[col]).mean()
+        print(f"{col}: {change:.3f}")
+
+    # -----------------------
+    # save
     # -----------------------
     if not args.get("dry_run", False):
+
         out_dir = os.path.join(
             script_dir,
             "steering_results",
-            args.model_name.replace("/", "_")
+            args.model_name
         )
         os.makedirs(out_dir, exist_ok=True)
 
         df.to_csv(os.path.join(out_dir, "results.csv"), index=False)
-        df.to_hdf(os.path.join(out_dir, "results.h5"), key="df", mode="w")
 
-        print("Saved →", out_dir)
+        print("\nSaved →", out_dir)
 
 
 # ------------------------------------------------------------
