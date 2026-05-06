@@ -1,28 +1,40 @@
 import os
 import sys
+import json
 import pandas as pd
 import tqdm
 import torch
-from omegaconf import DictConfig, OmegaConf
 import hydra
-
-# IMPORTANT: import iz compute_representations_fv
-from compute_representations_fv import load_fv_dataset
-
-from utils.model_utils import load_model_from_tl_name
-from utils.generation_utils import generate
+from omegaconf import DictConfig, OmegaConf
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_dir = script_dir
 os.chdir(project_dir)
 sys.path.append(project_dir)
 
+from utils.model_utils import load_model_from_tl_name
+from utils.generation_utils import generate
+from compute_representations_fv import load_fv_dataset
+
 config_path = os.path.join(project_dir, "config/format")
 
 
-# -------------------------
-# prompt
-# -------------------------
+# -----------------------------
+# RELAXED EVAL (FIX)
+# -----------------------------
+def normalize(s: str) -> str:
+    return s.lower().strip().strip(".,;:!?\"'")
+
+
+def relaxed_match(gen: str, expected: str) -> bool:
+    gen = normalize(gen)
+    expected = normalize(expected)
+    return expected in gen or expected == gen
+
+
+# -----------------------------
+# PROMPT
+# -----------------------------
 def build_prompt(r, tokenizer):
     messages = [{"role": "user", "content": r["input"]}]
     return tokenizer.apply_chat_template(
@@ -32,60 +44,57 @@ def build_prompt(r, tokenizer):
     )
 
 
-# -------------------------
-# steering hook
-# -------------------------
+# -----------------------------
+# STEERING HOOK
+# -----------------------------
 def add_steering_hook(model, layer_idx, steering_vector, alpha=1.0):
-
     def hook_fn(module, input, output):
         h = output[0]
-        h = h + alpha * steering_vector.to(h.device)
+
+        # FIX dtype mismatch (VERY IMPORTANT)
+        h = h + alpha * steering_vector.to(device=h.device, dtype=h.dtype)
+
         return (h,) + output[1:]
 
     return model.model.layers[layer_idx].register_forward_hook(hook_fn)
 
 
-# -------------------------
+# -----------------------------
 # MAIN
-# -------------------------
+# -----------------------------
 @hydra.main(config_path=config_path, config_name="compute_representations_fv")
 def run(args: DictConfig):
 
     print(OmegaConf.to_yaml(args))
 
-    # ---------------- model ----------------
+    # -------------------------
+    # MODEL
+    # -------------------------
     model, tokenizer = load_model_from_tl_name(
         args.model_name,
         device=args.device,
         cache_dir=args.transformers_cache_dir
     )
-
     model.eval()
 
-    # force dtype fix (IMPORTANT for tvoj error)
-    model = model.to(torch.float16)
-
-    # ---------------- dataset ----------------
-    tasks = args.tasks
-    if isinstance(tasks, str):
-        tasks = [tasks]
-
+    # -------------------------
+    # DATA
+    # -------------------------
     dfs = []
-    for t in tasks:
-        dfs.append(load_fv_dataset(t, args.fv_local_data_dir))
+    for task in args.tasks:
+        dfs.append(load_fv_dataset(task, args.fv_local_data_dir))
 
     data = pd.concat(dfs).reset_index(drop=True)
 
-    if args.use_data_subset:
-        data = data.sample(frac=float(args.data_subset_ratio), random_state=42)
+    if args.get("use_data_subset", False):
+        ratio = float(args.get("data_subset_ratio", 0.1))
+        data = data.head(max(1, int(len(data) * ratio)))
 
-    if args.dry_run:
-        data = data.head(5)
-
-    # ---------------- steering setup ----------------
+    # -------------------------
+    # STEERING VECTOR
+    # -------------------------
     hidden_size = model.config.hidden_size
-
-    steering_vector = torch.zeros(hidden_size, dtype=torch.float16)
+    steering_vector = torch.zeros(hidden_size)
     steering_vector[:10] = 1.0
     steering_vector = steering_vector.unsqueeze(0).unsqueeze(0)
 
@@ -100,7 +109,9 @@ def run(args: DictConfig):
 
     print("Steering layers:", steer_layers)
 
-    # ---------------- loop ----------------
+    # -------------------------
+    # LOOP
+    # -------------------------
     results = []
     pbar = tqdm.tqdm(total=len(data))
 
@@ -113,13 +124,14 @@ def run(args: DictConfig):
             "target": r["output"]
         }
 
-        # baseline
-        row["baseline"] = generate(
+        # ---------------- BASELINE ----------------
+        base = generate(
             model, tokenizer, prompt, args.device,
             max_new_tokens=args.max_generation_length
         )
+        row["baseline"] = base
 
-        # steering runs
+        # ---------------- STEERING ----------------
         for label, layer in steer_layers.items():
 
             if layer is None:
@@ -148,9 +160,27 @@ def run(args: DictConfig):
 
     df = pd.DataFrame(results)
 
-    # ---------------- save ----------------
+    # -------------------------
+    # RELAXED EVAL (FIX)
+    # -------------------------
+    def eval_col(col):
+        return df.apply(lambda r: relaxed_match(r[col], r["target"]), axis=1).mean()
+
+    print("\n=== Accuracy (relaxed) ===")
+    print("baseline:", eval_col("baseline"))
+
+    for c in ["l25_output", "l50_output", "l75_output"]:
+        print(f"{c}:", eval_col(c))
+
+    # -------------------------
+    # SAVE (NO HDF5 BUG)
+    # -------------------------
     if not args.dry_run:
-        out_dir = os.path.join(script_dir, "steering_results")
+        out_dir = os.path.join(
+            script_dir,
+            "steering_results",
+            args.model_name.replace("/", "_")
+        )
         os.makedirs(out_dir, exist_ok=True)
 
         df.to_csv(os.path.join(out_dir, "results.csv"), index=False)
