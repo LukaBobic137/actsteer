@@ -1,7 +1,6 @@
 import json
 import pandas as pd
-
-PATH = "steering_results/meta-llama_Meta-Llama-3-8B-Instruct/results_fv.json"
+PATH = "./results_fv.json"
 
 # -----------------------------
 # load JSON
