@@ -1,14 +1,11 @@
 import os
 import sys
-import json
 import pandas as pd
 import tqdm
 import torch
 import hydra
 from omegaconf import DictConfig, OmegaConf
 from compute_representations_fv import load_fv_dataset
-from utils.model_utils import load_model_from_tl_name
-from utils.generation_utils import generate
 
 # ------------------------------------------------------------
 # setup
@@ -18,42 +15,51 @@ project_dir = script_dir
 os.chdir(project_dir)
 sys.path.append(project_dir)
 
-config_path = os.path.join(project_dir, "config/format")
-
+from utils.model_utils import load_model_from_tl_name
+from utils.generation_utils import generate
 
 # ------------------------------------------------------------
-# prompt templates (FIXED: constrained outputs)
+# FV DATASET
 # ------------------------------------------------------------
-PROMPT_TEMPLATES = {
-    "english_french":
-        "Translate to French.\nReturn ONLY ONE WORD.\nEnglish: {input}\nFrench:",
+FV_DATASET_BASE = "https://raw.githubusercontent.com/ericwtodd/function_vectors/master/dataset_files"
 
-    "english_german":
-        "Translate to German.\nReturn ONLY ONE WORD.\nEnglish: {input}\nGerman:",
-
-    "synonyms":
-        "Give ONE synonym.\nReturn ONLY ONE WORD.\nWord: {input}\nSynonym:",
-
-    "antonyms":
-        "Give ONE antonym.\nReturn ONLY ONE WORD.\nWord: {input}\nAntonym:",
+FV_DATASETS = {
+    "english_french": "abstractive/english-french.json",
+    "english_german": "abstractive/english-german.json",
 }
 
+def load_fv_dataset(task_name, local_dir=None):
+    import json, requests
+
+    filename = FV_DATASETS[task_name]
+
+    data = None
+
+    if local_dir:
+        path = os.path.join(local_dir, filename)
+        if os.path.exists(path):
+            with open(path) as f:
+                data = json.load(f)
+
+    if data is None:
+        url = f"{FV_DATASET_BASE}/{filename}"
+        data = requests.get(url, timeout=30).json()
+
+    if isinstance(data, list):
+        inputs = [x["input"] for x in data]
+        outputs = [x["output"] for x in data]
+    else:
+        inputs = data["input"]
+        outputs = data["output"]
+
+    return pd.DataFrame({"input": inputs, "output": outputs})
+
 
 # ------------------------------------------------------------
-# utils
+# prompt
 # ------------------------------------------------------------
-def normalize(x):
-    return str(x).strip().lower()
-
-
-def exact_match(pred, target):
-    if not isinstance(pred, str):
-        return False
-    return normalize(pred) == normalize(target)
-
-
-def build_prompt(r, tokenizer, task):
-    messages = [{"role": "user", "content": PROMPT_TEMPLATES[task].format(input=r["input"])}]
+def build_prompt(r, tokenizer):
+    messages = [{"role": "user", "content": r["input"]}]
     return tokenizer.apply_chat_template(
         messages,
         add_generation_prompt=True,
@@ -68,7 +74,7 @@ def add_steering_hook(model, layer_idx, steering_vector, alpha=1.0):
 
     def hook_fn(module, input, output):
         h = output[0]
-        h = h + alpha * steering_vector.to(h.device)
+        h = h + alpha * steering_vector.to(h.device).to(h.dtype)
         return (h,) + output[1:]
 
     return model.model.layers[layer_idx].register_forward_hook(hook_fn)
@@ -77,14 +83,14 @@ def add_steering_hook(model, layer_idx, steering_vector, alpha=1.0):
 # ------------------------------------------------------------
 # main
 # ------------------------------------------------------------
-@hydra.main(config_path=config_path, config_name="compute_representations_fv")
+@hydra.main(config_path="config/format", config_name="compute_representations_fv")
 def run(args: DictConfig):
 
     print(OmegaConf.to_yaml(args))
 
-    # -----------------------
+    # ----------------------------
     # model
-    # -----------------------
+    # ----------------------------
     model, tokenizer = load_model_from_tl_name(
         args.model_name,
         device=args.device,
@@ -92,76 +98,65 @@ def run(args: DictConfig):
     )
     model.eval()
 
-    # -----------------------
-    # load data
-    # -----------------------
-    local_dir = args.get("fv_local_data_dir", None)
+    model_dtype = next(model.parameters()).dtype
+
+    # ----------------------------
+    # data
+    # ----------------------------
+    tasks = args.tasks if isinstance(args.tasks, list) else [args.tasks]
 
     dfs = []
-    for task in args.tasks:
-        df = load_fv_dataset(task, local_dir)
-        df["task"] = task
-        dfs.append(df)
+    for t in tasks:
+        dfs.append(load_fv_dataset(t, args.fv_local_data_dir))
 
-    data = pd.concat(dfs)
+    data = pd.concat(dfs, ignore_index=True)
 
-    # shuffle (IMPORTANT FIX)
-    data = data.sample(frac=1, random_state=42).reset_index(drop=True)
+    # subset
+    if args.use_data_subset:
+        data = data.sample(frac=float(args.data_subset_ratio), random_state=42)
 
-    # subset / dry run
-    if args.get("use_data_subset", False):
-        data = data.head(int(len(data) * args.data_subset_ratio))
-
-    if args.get("dry_run", False):
+    if args.dry_run:
         data = data.head(5)
 
-    # -----------------------
-    # steering vector (placeholder)
-    # -----------------------
-    hidden_size = model.config.hidden_size
-    steering_vector = torch.zeros(hidden_size)
+    # ----------------------------
+    # steering vector (PLACEHOLDER)
+    # ----------------------------
+    hidden = model.config.hidden_size
+
+    steering_vector = torch.zeros(hidden, dtype=model_dtype)
     steering_vector[:10] = 1.0
     steering_vector = steering_vector.unsqueeze(0).unsqueeze(0)
 
-    layers = model.config.num_hidden_layers
+    # layer selection
+    n_layers = model.config.num_hidden_layers
+
     steer_layers = {
         "baseline": None,
-        "l25": int(layers * 0.25),
-        "l50": int(layers * 0.50),
-        "l75": int(layers * 0.75),
+        "l25": int(n_layers * 0.25),
+        "l50": int(n_layers * 0.50),
+        "l75": int(n_layers * 0.75),
     }
 
     print("Steering layers:", steer_layers)
 
-    # -----------------------
-    # run
-    # -----------------------
+    # ----------------------------
+    # eval loop
+    # ----------------------------
     results = []
-    pbar = tqdm.tqdm(total=len(data))
 
-    for _, r in data.iterrows():
+    for _, r in tqdm.tqdm(data.iterrows(), total=len(data)):
 
-        task = r["task"]
-        prompt = build_prompt(r, tokenizer, task)
+        prompt = build_prompt(r, tokenizer)
 
         row = {
             "input": r["input"],
-            "target": r["output"],
-            "task": task
+            "target": r["output"]
         }
 
-        # -----------------------
         # baseline
-        # -----------------------
-        baseline = generate(
-            model, tokenizer, prompt, args.device,
-            max_new_tokens=args.max_generation_length
-        )
-        row["baseline"] = baseline
+        row["baseline"] = generate(model, tokenizer, prompt, args.device)
 
-        # -----------------------
         # steering runs
-        # -----------------------
         for label, layer in steer_layers.items():
 
             if layer is None:
@@ -169,57 +164,35 @@ def run(args: DictConfig):
 
             handle = add_steering_hook(
                 model,
-                layer_idx=layer,
-                steering_vector=steering_vector,
+                layer,
+                steering_vector,
                 alpha=1.0
             )
 
-            out = generate(
-                model, tokenizer, prompt, args.device,
-                max_new_tokens=args.max_generation_length
-            )
+            out = generate(model, tokenizer, prompt, args.device)
 
             handle.remove()
 
             row[label] = out
 
         results.append(row)
-        pbar.update(1)
-
-    pbar.close()
 
     df = pd.DataFrame(results)
 
-    # -----------------------
-    # evaluation (FIXED)
-    # -----------------------
-    print("\n=== Accuracy ===")
-    for col in ["baseline", "l25", "l50", "l75"]:
-        acc = df.apply(lambda r: exact_match(r[col], r["target"]), axis=1).mean()
-        print(f"{col}: {acc:.3f}")
-
-    print("\n=== Change rate vs baseline ===")
-    for col in ["l25", "l50", "l75"]:
-        change = (df["baseline"] != df[col]).mean()
-        print(f"{col}: {change:.3f}")
-
-    # -----------------------
+    # ----------------------------
     # save
-    # -----------------------
-    if not args.get("dry_run", False):
-
+    # ----------------------------
+    if not args.dry_run:
         out_dir = os.path.join(
-            script_dir,
             "steering_results",
-            args.model_name
+            args.model_name.replace("/", "_")
         )
         os.makedirs(out_dir, exist_ok=True)
 
         df.to_csv(os.path.join(out_dir, "results.csv"), index=False)
 
-        print("\nSaved →", out_dir)
+        print("Saved →", out_dir)
 
 
-# ------------------------------------------------------------
 if __name__ == "__main__":
     run()
