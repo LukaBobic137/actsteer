@@ -1,149 +1,106 @@
-import os
 import json
-import argparse
-import torch
-from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM
 
-from fv_dataset_loader import load_fv_dataset
+PATH = "results_fv.json"
 
-
-# ----------------------------
-# ARGUMENTS
-# ----------------------------
-def parse_args():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument("--model_name", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct")
-    parser.add_argument("--data_dir", type=str, default="dataset_files")
-
-    parser.add_argument("--use_subset", action="store_true")
-    parser.add_argument("--subset_ratio", type=float, default=0.05)
-
-    parser.add_argument("--output_dir", type=str, default="results")
-
-    return parser.parse_args()
+with open(PATH, "r") as f:
+    data = json.load(f)
 
 
-# ----------------------------
-# SIMPLE GENERATION
-# ----------------------------
-@torch.no_grad()
-def generate(model, tokenizer, text, max_new_tokens=20):
-    inputs = tokenizer(text, return_tensors="pt").to(model.device)
+def analyze_task(task_name, res):
+    print(f"\n================ {task_name.upper()} ================")
 
-    out = model.generate(
-        **inputs,
-        max_new_tokens=max_new_tokens,
-        do_sample=False
-    )
+    baseline = res["baseline"]
+    print(f"baseline: {baseline:.4f}")
 
-    decoded = tokenizer.decode(out[0], skip_special_tokens=True)
+    best_layer = None
+    best_value = baseline
 
-    # only continuation
-    return decoded[len(text):].strip()
+    print("\n--- layers ---")
+    for k, v in res.items():
+        if k == "baseline":
+            continue
 
+        delta = v - baseline
+        print(f"{k}: {v:.4f} (Δ {delta:+.4f})")
 
-# ----------------------------
-# SIMPLE MATCH (FV style)
-# ----------------------------
-def is_correct(pred, target):
-    if pred is None:
-        return False
-    return pred.strip().split()[0].lower() == str(target).strip().split()[0].lower()
+        if v > best_value:
+            best_value = v
+            best_layer = k
 
+    # -----------------------------
+    # SUMMARY
+    # -----------------------------
+    print("\n--- summary ---")
 
-# ----------------------------
-# STEERING PLACEHOLDER
-# (ako imaš pravi FV hook, ovdje ga spajaš)
-# ----------------------------
-def apply_steering(model, layer_id):
-    """
-    PLACEHOLDER:
-    Ako imaš FV hooking, ovo se ovdje spaja.
-    Trenutno samo vraća model.
-    """
-    return model
+    if best_layer is None:
+        print("❌ No improvement over baseline")
+    else:
+        print(f"✅ Best layer: {best_layer} (+{best_value - baseline:.4f})")
 
-
-# ----------------------------
-# MAIN
-# ----------------------------
-def main():
-    args = parse_args()
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    print("Loading model...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name,
-        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-        device_map="auto"
-    )
-
-    print("Loading dataset...")
-    df = load_fv_dataset(args.data_dir)
-
-    if args.use_subset:
-        df = df.sample(frac=args.subset_ratio, random_state=42)
-
-    print(f"Dataset size: {len(df)}")
-
-    results = []
-
-    # steering layers (iz paper setupa)
-    steering_layers = {
-        "baseline": None,
-        "l25": 8,
-        "l50": 16,
-        "l75": 24
+    return {
+        "baseline": baseline,
+        "best_layer": best_layer,
+        "best_gain": best_value - baseline
     }
 
-    for row in tqdm(df.to_dict(orient="records")):
 
-        input_text = row["input"]
-        target = row["target"]
+# -----------------------------
+# RUN ANALYSIS
+# -----------------------------
+summary = {}
 
-        sample = {
-            "input": input_text,
-            "target": target
-        }
-
-        # -------------------------
-        # BASELINE
-        # -------------------------
-        baseline_pred = generate(model, tokenizer, input_text)
-        sample["baseline"] = baseline_pred
-
-        # -------------------------
-        # STEERING RUNS
-        # -------------------------
-        for name, layer in steering_layers.items():
-
-            if name == "baseline":
-                continue
-
-            steered_model = apply_steering(model, layer)
-
-            pred = generate(steered_model, tokenizer, input_text)
-
-            sample[f"{name}_output"] = pred
-
-        results.append(sample)
-
-    # ----------------------------
-    # SAVE
-    # ----------------------------
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    out_path = os.path.join(args.output_dir, "results_fv.json")
-
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
-
-    print(f"\nSaved → {out_path}")
+for task, res in data.items():
+    summary[task] = analyze_task(task, res)
 
 
-if __name__ == "__main__":
-    main()
+# -----------------------------
+# CROSS-TASK INTERPRETATION
+# -----------------------------
+print("\n================ GLOBAL INTERPRETATION ================")
+
+t = summary.get("translation", {})
+s = summary.get("synonym", {})
+a = summary.get("antonym", {})
+
+if t.get("best_gain", 0) > 0:
+    print("✔ Steering improves TRANSLATION → signal exists")
+else:
+    print("✖ No improvement on TRANSLATION → weak vector")
+
+if s.get("best_gain", 0) > 0:
+    print("✔ Generalizes to SYNONYMS → semantic direction")
+else:
+    print("• No synonym gain → task-specific vector")
+
+if a.get("best_gain", 0) < 0:
+    print("✔ ANTONYM drop → expected (semantic bias)")
+elif a.get("best_gain", 0) > 0:
+    print("⚠ Unexpected ANTONYM improvement → check behavior")
+else:
+    print("• Neutral on ANTONYM")
+
+
+# -----------------------------
+# FINAL SCORE
+# -----------------------------
+print("\n================ QUICK SCORE ================")
+
+score = 0
+
+if t.get("best_gain", 0) > 0:
+    score += 1
+if s.get("best_gain", 0) > 0:
+    score += 1
+if a.get("best_gain", 0) >= -0.01:  # toleriramo mali pad
+    score += 1
+
+print(f"Score: {score}/3")
+
+if score == 3:
+    print("🔥 Excellent steering vector")
+elif score == 2:
+    print("👍 Good, but can be improved")
+elif score == 1:
+    print("⚠ Weak signal")
+else:
+    print("❌ Steering not working")
