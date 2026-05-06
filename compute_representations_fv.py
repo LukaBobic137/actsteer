@@ -6,6 +6,7 @@ import tqdm
 import json
 import requests
 import numpy as np
+from typing import Optional
 from omegaconf import DictConfig, OmegaConf
 import hydra
 
@@ -41,7 +42,7 @@ FV_DATASETS = {
 }
 
 
-def load_fv_dataset(task_name: str, local_data_dir: str | None = None) -> pd.DataFrame:
+def load_fv_dataset(task_name: str, local_data_dir: Optional[str] = None) -> pd.DataFrame:
     """Load a Function Vectors dataset.
 
     Tries a local directory first (useful if you've already cloned the repo),
