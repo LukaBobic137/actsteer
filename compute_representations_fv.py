@@ -158,7 +158,13 @@ def compute_representations_fv(args: DictConfig):
     print(f"Probing layers: {depth_layers}")
 
     # ---- Determine which tasks to run -------------------------------------
-    tasks_to_run = list(args.get("tasks", FV_DATASETS.keys()))
+tasks_to_run = args.get("tasks", None)
+
+# normalize Hydra weirdness
+if tasks_to_run is None:
+    tasks_to_run = list(FV_DATASETS.keys())
+elif isinstance(tasks_to_run, str):
+    tasks_to_run = [tasks_to_run]
 
     # ---- Process each task -------------------------------------------------
     for task_name in tasks_to_run:

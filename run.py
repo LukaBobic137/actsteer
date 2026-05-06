@@ -1,192 +1,125 @@
 import os
-import sys
-import json
-import pandas as pd
-import tqdm
+import argparse
 import torch
-import hydra
-from omegaconf import DictConfig, OmegaConf
+from tqdm import tqdm
 
-script_dir = os.path.dirname(os.path.abspath(__file__))
-project_dir = script_dir
-os.chdir(project_dir)
-sys.path.append(project_dir)
-
-from utils.model_utils import load_model_from_tl_name
-from utils.generation_utils import generate
-from compute_representations_fv import load_fv_dataset
-
-config_path = os.path.join(project_dir, "config/format")
+from utils.fv_dataset_loader import load_fv_dataset
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
 # -----------------------------
-# RELAXED EVAL (FIX)
+# ARGPARSE
 # -----------------------------
-def normalize(s: str) -> str:
-    return s.lower().strip().strip(".,;:!?\"'")
+def parse_args():
+    parser = argparse.ArgumentParser()
 
+    parser.add_argument("--model_name", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct")
+    parser.add_argument("--data_dir", type=str, default="dataset_files")
+    parser.add_argument("--use_subset", type=bool, default=True)
+    parser.add_argument("--subset_ratio", type=float, default=0.1)
 
-def relaxed_match(gen: str, expected: str) -> bool:
-    gen = normalize(gen)
-    expected = normalize(expected)
-    return expected in gen or expected == gen
-
-
-# -----------------------------
-# PROMPT
-# -----------------------------
-def build_prompt(r, tokenizer):
-    messages = [{"role": "user", "content": r["input"]}]
-    return tokenizer.apply_chat_template(
-        messages,
-        add_generation_prompt=True,
-        tokenize=False
-    )
+    return parser.parse_args()
 
 
 # -----------------------------
-# STEERING HOOK
+# SIMPLE MATCHING (REALISTIC)
 # -----------------------------
-def add_steering_hook(model, layer_idx, steering_vector, alpha=1.0):
-    def hook_fn(module, input, output):
-        h = output[0]
+def is_correct(pred, target):
+    pred = pred.lower().strip()
+    target = target.lower().strip()
 
-        # FIX dtype mismatch (VERY IMPORTANT)
-        h = h + alpha * steering_vector.to(device=h.device, dtype=h.dtype)
+    return target in pred or pred.split()[0] == target.split()[0]
 
-        return (h,) + output[1:]
 
-    return model.model.layers[layer_idx].register_forward_hook(hook_fn)
+# -----------------------------
+# GENERATION
+# -----------------------------
+def generate(model, tokenizer, text, device):
+    inputs = tokenizer(text, return_tensors="pt").to(device)
+
+    with torch.no_grad():
+        out = model.generate(
+            **inputs,
+            max_new_tokens=20,
+            do_sample=False,
+            temperature=0.0
+        )
+
+    return tokenizer.decode(out[0], skip_special_tokens=True)
+
+
+# -----------------------------
+# EVAL
+# -----------------------------
+def evaluate(model, tokenizer, dataset, device):
+    correct = 0
+    total = 0
+
+    results = []
+
+    for ex in tqdm(dataset):
+        prompt = ex["input"]
+        target = ex["target"]
+
+        pred = generate(model, tokenizer, prompt, device)
+
+        ok = is_correct(pred, target)
+
+        correct += int(ok)
+        total += 1
+
+        results.append({
+            "input": prompt,
+            "target": target,
+            "pred": pred,
+            "correct": ok
+        })
+
+    acc = correct / max(total, 1)
+
+    return acc, results
 
 
 # -----------------------------
 # MAIN
 # -----------------------------
-@hydra.main(config_path=config_path, config_name="compute_representations_fv")
-def run(args: DictConfig):
+def main():
+    args = parse_args()
 
-    print(OmegaConf.to_yaml(args))
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # -------------------------
-    # MODEL
-    # -------------------------
-    model, tokenizer = load_model_from_tl_name(
+    print(f"Loading model: {args.model_name}")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
-        device=args.device,
-        cache_dir=args.transformers_cache_dir
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        device_map="auto"
     )
-    model.eval()
 
-    # -------------------------
-    # DATA
-    # -------------------------
-    dfs = []
-    for task in args.tasks:
-        dfs.append(load_fv_dataset(task, args.fv_local_data_dir))
+    tasks = ["english-french", "english-german", "english-spanish"]
 
-    data = pd.concat(dfs).reset_index(drop=True)
+    print("Loading dataset...")
+    dataset = load_fv_dataset(args.data_dir, tasks)
 
-    if args.get("use_data_subset", False):
-        ratio = float(args.get("data_subset_ratio", 0.1))
-        data = data.head(max(1, int(len(data) * ratio)))
+    if args.use_subset:
+        dataset = dataset[: int(len(dataset) * args.subset_ratio)]
 
-    # -------------------------
-    # STEERING VECTOR
-    # -------------------------
-    hidden_size = model.config.hidden_size
-    steering_vector = torch.zeros(hidden_size)
-    steering_vector[:10] = 1.0
-    steering_vector = steering_vector.unsqueeze(0).unsqueeze(0)
+    print(f"Dataset size: {len(dataset)}")
 
-    num_layers = model.config.num_hidden_layers
+    print("Running evaluation...")
+    acc, results = evaluate(model, tokenizer, dataset, device)
 
-    steer_layers = {
-        "baseline": None,
-        "l25": int(num_layers * 0.25),
-        "l50": int(num_layers * 0.50),
-        "l75": int(num_layers * 0.75),
-    }
+    print("\n=== RESULTS ===")
+    print(f"Accuracy: {acc:.4f}")
 
-    print("Steering layers:", steer_layers)
+    # save
+    out_path = "results_fv.json"
+    import json
+    with open(out_path, "w") as f:
+        json.dump(results, f, indent=2)
 
-    # -------------------------
-    # LOOP
-    # -------------------------
-    results = []
-    pbar = tqdm.tqdm(total=len(data))
-
-    for _, r in data.iterrows():
-
-        prompt = build_prompt(r, tokenizer)
-
-        row = {
-            "input": r["input"],
-            "target": r["output"]
-        }
-
-        # ---------------- BASELINE ----------------
-        base = generate(
-            model, tokenizer, prompt, args.device,
-            max_new_tokens=args.max_generation_length
-        )
-        row["baseline"] = base
-
-        # ---------------- STEERING ----------------
-        for label, layer in steer_layers.items():
-
-            if layer is None:
-                continue
-
-            handle = add_steering_hook(
-                model,
-                layer_idx=layer,
-                steering_vector=steering_vector,
-                alpha=1.0
-            )
-
-            out = generate(
-                model, tokenizer, prompt, args.device,
-                max_new_tokens=args.max_generation_length
-            )
-
-            handle.remove()
-
-            row[f"{label}_output"] = out
-
-        results.append(row)
-        pbar.update(1)
-
-    pbar.close()
-
-    df = pd.DataFrame(results)
-
-    # -------------------------
-    # RELAXED EVAL (FIX)
-    # -------------------------
-    def eval_col(col):
-        return df.apply(lambda r: relaxed_match(r[col], r["target"]), axis=1).mean()
-
-    print("\n=== Accuracy (relaxed) ===")
-    print("baseline:", eval_col("baseline"))
-
-    for c in ["l25_output", "l50_output", "l75_output"]:
-        print(f"{c}:", eval_col(c))
-
-    # -------------------------
-    # SAVE (NO HDF5 BUG)
-    # -------------------------
-    if not args.dry_run:
-        out_dir = os.path.join(
-            script_dir,
-            "steering_results",
-            args.model_name.replace("/", "_")
-        )
-        os.makedirs(out_dir, exist_ok=True)
-
-        df.to_csv(os.path.join(out_dir, "results.csv"), index=False)
-
-        print("Saved →", out_dir)
+    print(f"Saved → {out_path}")
 
 
 if __name__ == "__main__":
-    run()
+    main()
