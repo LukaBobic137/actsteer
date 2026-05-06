@@ -4,10 +4,10 @@ import json
 import pandas as pd
 import tqdm
 import torch
-from compute_representations_fv import load_fv_dataset
 from omegaconf import DictConfig, OmegaConf
 import hydra
 
+from compute_representations_fv import load_fv_dataset
 from utils.model_utils import load_model_from_tl_name
 from utils.generation_utils import generate
 
@@ -17,18 +17,6 @@ os.chdir(project_dir)
 sys.path.append(project_dir)
 
 config_path = os.path.join(project_dir, "config/format")
-
-
-# ------------------------------------------------------------
-# LOAD DATA
-# ------------------------------------------------------------
-def load_data(path, limit=None):
-    with open(path) as f:
-        data = [json.loads(l) for l in f.readlines()]
-    df = pd.DataFrame(data)
-    if limit:
-        df = df.head(limit)
-    return df
 
 
 # ------------------------------------------------------------
@@ -50,7 +38,10 @@ def add_steering_hook(model, layer_idx, steering_vector, alpha=1.0):
 
     def hook_fn(module, input, output):
         h = output[0]
-        h = h + alpha * steering_vector.to(h.device)
+
+        # FIX: dtype + device alignment (CRITICAL)
+        h = h + alpha * steering_vector.to(h.device).to(h.dtype)
+
         return (h,) + output[1:]
 
     return model.model.layers[layer_idx].register_forward_hook(hook_fn)
@@ -65,7 +56,7 @@ def run(args: DictConfig):
     print(OmegaConf.to_yaml(args))
 
     # -----------------------
-    # model
+    # MODEL
     # -----------------------
     model, tokenizer = load_model_from_tl_name(
         args.model_name,
@@ -75,33 +66,42 @@ def run(args: DictConfig):
     model.eval()
 
     # -----------------------
-    # data
+    # DATA
     # -----------------------
-    # FV dataset loading (correct version)
     local_dir = args.get("fv_local_data_dir", None)
 
-    task_dfs = []
+    dfs = []
     for task in args.tasks:
-        df = load_fv_dataset(task, local_dir)
-        task_dfs.append(df)
+        dfs.append(load_fv_dataset(task, local_dir))
 
-    data = pd.concat(task_dfs)
+    data = pd.concat(dfs).reset_index(drop=True)
+
+    if args.get("use_data_subset", False):
+        ratio = float(args.get("data_subset_ratio", 0.1))
+        data = data.iloc[:max(1, int(len(data) * ratio))]
+
+    if args.get("dry_run", False):
+        data = data.head(5)
 
     # -----------------------
-    # STEERING SETUP
+    # STEERING VECTOR (placeholder)
     # -----------------------
     hidden_size = model.config.hidden_size
 
-    # ⚠️ PLACEHOLDER VECTOR (replace with real one later)
-    steering_vector = torch.zeros(hidden_size)
+    steering_vector = torch.zeros(hidden_size, dtype=torch.float16)
     steering_vector[:10] = 1.0
-    steering_vector = steering_vector.unsqueeze(0).unsqueeze(0)
+    steering_vector = steering_vector.view(1, 1, -1)
+
+    # -----------------------
+    # LAYERS
+    # -----------------------
+    n_layers = model.config.num_hidden_layers
 
     steer_layers = {
         "baseline": None,
-        "l25": int(model.config.num_hidden_layers * 0.25),
-        "l50": int(model.config.num_hidden_layers * 0.50),
-        "l75": int(model.config.num_hidden_layers * 0.75),
+        "l25": int(n_layers * 0.25),
+        "l50": int(n_layers * 0.50),
+        "l75": int(n_layers * 0.75),
     }
 
     print("Steering layers:", steer_layers)
@@ -117,21 +117,20 @@ def run(args: DictConfig):
         prompt = build_prompt(r, tokenizer)
 
         row = {
-            "input": r.get("prompt", ""),
-            "target": r.get("output", None),
+            "input": r["input"],
+            "target": r.get("output", "")
         }
 
         # -----------------------
         # BASELINE
         # -----------------------
-        base_out = generate(
+        row["baseline"] = generate(
             model, tokenizer, prompt, args.device,
             max_new_tokens=args.max_generation_length
         )
-        row["baseline"] = base_out
 
         # -----------------------
-        # STEERING RUNS
+        # STEERED RUNS
         # -----------------------
         for label, layer in steer_layers.items():
 
@@ -164,18 +163,18 @@ def run(args: DictConfig):
     # -----------------------
     # SAVE
     # -----------------------
-    if not args.dry_run:
+    if not args.get("dry_run", False):
         out_dir = os.path.join(
             script_dir,
             "steering_results",
-            args.model_name
+            args.model_name.replace("/", "_")
         )
         os.makedirs(out_dir, exist_ok=True)
 
         df.to_csv(os.path.join(out_dir, "results.csv"), index=False)
         df.to_hdf(os.path.join(out_dir, "results.h5"), key="df", mode="w")
 
-        print("Saved results →", out_dir)
+        print("Saved →", out_dir)
 
 
 # ------------------------------------------------------------
