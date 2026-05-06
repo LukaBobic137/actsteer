@@ -33,12 +33,12 @@ FV_DATASET_BASE = (
 # Datasets from Appendix E that we care about.
 # Each entry maps a short task name → the JSON filename in the FV repo.
 FV_DATASETS = {
-    "english_french":    "english_french.json",
-    "english_german":    "english_german.json",   # extra translation pair
-    "synonyms":          "synonym.json",
-    "antonyms":          "antonym.json",
-    "country_capital":   "country_capital.json",
-    "person_sport":      "person_sport.json",
+    "english_french":    "abstractive/english_french.json",
+    "english_german":    "abstractive/english_german.json",
+    "synonyms":          "abstractive/synonym.json",
+    "antonyms":          "abstractive/antonym.json",
+    "country_capital":   "extractive/country_capital.json",
+    "person_sport":      "extractive/person_sport.json",
 }
 
 
