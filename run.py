@@ -166,25 +166,25 @@ def run_task(model, tokenizer, device, data, name, vec, layers):
 
     print("baseline:", baseline)
 
-    alphas = [0.05, 0.1, 0.2]
+    alphas = [0.05, 0.1, 0.2, 0.5]
 
     for lname, layer_idx in layers.items():
 
-        best = 0
+        results[lname] = {}
+
+        print(f"\n--- {lname} ---")
 
         for a in alphas:
+
             acc = evaluate(
                 model, tokenizer, data,
                 device, layer_idx, vec, a,
                 prompt_map[name]
             )
 
-            best = max(best, acc)
+            results[lname][str(a)] = acc
 
-        results[lname] = best
-        print(f"{lname}: {best:.4f}")
-
-    return results
+            print(f"alpha={a}: {acc:.4f}")
 
 
 def main():
