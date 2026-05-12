@@ -8,6 +8,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 # LOAD JSON
 # -----------------------------
 def load_json(path, ratio=1.0):
+
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
@@ -29,7 +30,7 @@ def match(pred, target):
 
 
 # -----------------------------
-# CORRUPT (BAD EXAMPLES)
+# CORRUPT
 # -----------------------------
 def corrupt(text):
 
@@ -47,14 +48,19 @@ def corrupt(text):
 @torch.no_grad()
 def get_hidden(model, tokenizer, text, device):
 
-    inp = tokenizer(text, return_tensors="pt").to(device)
+    inp = tokenizer(
+        text,
+        return_tensors="pt"
+    ).to(device)
 
     out = model(
         **inp,
         output_hidden_states=True
     )
 
-    h = out.hidden_states[len(out.hidden_states) // 2]
+    h = out.hidden_states[
+        len(out.hidden_states) // 2
+    ]
 
     return h[0, -1].float()
 
@@ -76,7 +82,10 @@ def build_vector(
 
     for ex in data:
 
-        good_text = f"{text_prefix}: {ex['input']}"
+        good_text = (
+            f"{text_prefix}: {ex['input']}"
+        )
+
         bad_text = corrupt(good_text)
 
         good_vecs.append(
@@ -97,8 +106,13 @@ def build_vector(
             )
         )
 
-    mu_good = torch.stack(good_vecs).mean(0)
-    mu_bad = torch.stack(bad_vecs).mean(0)
+    mu_good = torch.stack(
+        good_vecs
+    ).mean(0)
+
+    mu_bad = torch.stack(
+        bad_vecs
+    ).mean(0)
 
     v = mu_good - mu_bad
 
@@ -186,7 +200,9 @@ def evaluate(
 
     for ex in data:
 
-        prompt = f"{prompt_prefix}: {ex['input']}"
+        prompt = (
+            f"{prompt_prefix}: {ex['input']}"
+        )
 
         pred = generate(
             model,
@@ -231,7 +247,6 @@ def run_task(
     print(f"\n================ {name.upper()} ================")
 
     prompt_map = {
-        "translation": "Translate English to French",
         "synonym": "Find synonym",
         "antonym": "Find antonym"
     }
@@ -245,7 +260,9 @@ def run_task(
 
     for ex in data:
 
-        prompt = f"{prompt_map[name]}: {ex['input']}"
+        prompt = (
+            f"{prompt_map[name]}: {ex['input']}"
+        )
 
         pred = generate(
             model,
@@ -261,7 +278,7 @@ def run_task(
 
     results["baseline"] = baseline
 
-    print(f"baseline: {baseline}")
+    print(f"baseline: {baseline:.4f}")
 
     # -----------------------------
     # ALPHAS
@@ -344,11 +361,6 @@ def main():
     # -----------------------------
     # DATASETS
     # -----------------------------
-    translation = load_json(
-        "dataset_files/english-french.json",
-        args.subset
-    )
-
     synonym = load_json(
         "dataset_files/synonym.json",
         args.subset
@@ -367,27 +379,6 @@ def main():
     layers = get_layers(L)
 
     all_results = {}
-
-    # =========================================================
-    # TRANSLATION
-    # =========================================================
-    translation_vec = build_vector(
-        model,
-        tokenizer,
-        translation,
-        device,
-        "Translate English to French"
-    )
-
-    all_results["translation"] = run_task(
-        model,
-        tokenizer,
-        device,
-        translation,
-        "translation",
-        translation_vec,
-        layers
-    )
 
     # =========================================================
     # SYNONYM
