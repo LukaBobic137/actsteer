@@ -283,7 +283,7 @@ def run_task(
     # -----------------------------
     # ALPHAS
     # -----------------------------
-    alphas = [0.05, 0.1, 0.2, 0.5]
+    alphas = [10, 100, 1000, 5000]
 
     for lname, layer_idx in layers.items():
 
